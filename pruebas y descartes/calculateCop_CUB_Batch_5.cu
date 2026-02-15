@@ -1,8 +1,7 @@
 /*
-  Calculo de anomalia climatica paralelo (2026)
+  Calculo de anomalia climatica paralelo (2025)
   Autor: Bastian Troncoso Retamales
-  Modificaciones: Bruno Burgos Kosmalski
-  Sort -> Thrust en CPU y DeviceSegmentedRadixSort (CUB) en GPU
+  Sort -> Thrust en CPU
 */
 
 #include <stdio.h>

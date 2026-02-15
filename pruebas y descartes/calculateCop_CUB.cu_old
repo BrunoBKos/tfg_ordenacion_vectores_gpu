@@ -1,8 +1,7 @@
 /*
-  Calculo de anomalia climatica paralelo (2026)
+  Calculo de anomalia climatica paralelo (2025)
   Autor: Bastian Troncoso Retamales
-  Modificaciones: Bruno Burgos Kosmalski
-  Sort -> Thrust en CPU y DeviceRadixSort (CUB) en GPU
+  Sort -> Thrust en CPU
 */
 
 #include <stdio.h>
@@ -72,7 +71,6 @@ int encontrarPercentilFloat(float *percentiles, float valor);
 int calculateEstresTermico(PointData *data);
 int calculateEstresHidrico(PointData *data);
 void calculateAnomaliaClimatica(PointData *data, unsigned long *not_valid);
-void calculateAnomaliaClimatica_Batch(short* estres_termico, short* estres_hidrico, short* anomalia_climatica, unsigned long *not_valid);
 void initNetCDFFiles(NetCDFFile *prec, NetCDFFile *tg, NetCDFFile *out, double *time, int NUM_THREADS);
 double getDayLength(double day);
 
@@ -98,159 +96,83 @@ int main(int argc, char *argv[]) {
     double start_time, end_time;
     start_time = omp_get_wtime();
     
-    emptyKernel<<<1, 1>>>(); //warmup
+    // emptyKernel<<<1, 1>>>; //warmup
     #pragma omp parallel shared(time) reduction(+:total_not_valid, notCalculated) num_threads(NUM_THREADS)
     {
-
-      PointData data_1;
-      PointData data_2;
-      PointData* data_empty = &data_1;
-      PointData* data_full = &data_2;
-      PointData* data_aux;
-
+      PointData data;
       int i, threadId = omp_get_thread_num();
       unsigned long local_not_valid = 0;
 
       /* GPU Execution Variables */
 
-      float* d_input;
-      float* d_output;
+      short* d_input;
+      short* d_output;
 
       void* d_temp_storage = NULL;
       size_t temp_storage_bytes = 0;
       cudaStream_t stream;
 
-      cudaMalloc(&d_input, TIME*sizeof(float));
-      cudaMalloc(&d_output, TIME*sizeof(float));
+      cudaMalloc(&d_input, TIME*sizeof(short));
+      cudaMalloc(&d_output, TIME*sizeof(short));
       
       cudaStreamCreate(&stream);
 
-      cub::DeviceRadixSort::SortKeys(d_temp_storage, temp_storage_bytes, d_input, d_output, TIME, 0, sizeof(float)*8, stream);
+      cub::DeviceRadixSort::SortKeys(d_temp_storage, temp_storage_bytes, d_input, d_output, TIME, 0, sizeof(short)*8, stream);
 
       cudaMalloc(&d_temp_storage, temp_storage_bytes);
 
-      // FIN DE LA LLAMADA DE PRUEBA E INICIALIZACIÓN DE LAS VARIABLES TEMPORALES PARA LA GPU
-
-      size_t start[3];
-      start[2] = 0;
-      size_t count[3] = {1, 1, TIME};;
-      size_t start_previous[3];
-      start_previous[2] = 0;
-      int previous_invalidValue = 1;
-      int invalidValue;
-      int previous = 0;
-      int to_write = 0;
       /* HILOS PRODUCTORES*/
       #pragma omp for collapse(2) schedule(guided)
       for (int j = 0; j < LAT; j++) {
         for (int k = 0; k < LON; k++) {
-          if(!previous_invalidValue) {
-            cudaMemcpyAsync(d_input, (*data_full).drought_code, TIME*sizeof(float), cudaMemcpyHostToDevice, stream);
-            cub::DeviceRadixSort::SortKeys(d_temp_storage, temp_storage_bytes, d_input, d_output, TIME, 0, sizeof(float)*8, stream);
-          }
-          if(to_write) { // SE ESCRIBE LO CALCUADO
-            #pragma omp critical
-            {
-              int retval = nc_put_vara_short(outFile.ncId, outFile.varId, start, count, (*data_empty).anomalia_climatica);
-              if (retval != NC_NOERR) {
-                printf("Error al escribir en NetCDF en la celda (%d,%d): %s\n", j, k, nc_strerror(retval));
-                exit(EXIT_FAILURE);
-              }
-            }
-          }
-          start[0] = (size_t)j;
-          start[1] = (size_t)k;
-          // lectura del vector actual ( cambiar para que sea empty )
-          int ret1 = nc_get_vara_short(tgFiles[threadId].ncId, tgFiles[threadId].varId, start, count, (*data_empty).part_tg_val);
-          int ret2 = nc_get_vara_float(precFiles[threadId].ncId, precFiles[threadId].varId, start, count, (*data_empty).part_prec_val);
+          size_t start[3] = {(size_t)j, (size_t)k, 0};
+          size_t count[3] = {1, 1, TIME};
+    
+          int ret1 = nc_get_vara_short(tgFiles[threadId].ncId, tgFiles[threadId].varId, start, count, data.part_tg_val);
+          int ret2 = nc_get_vara_float(precFiles[threadId].ncId, precFiles[threadId].varId, start, count, data.part_prec_val);
           if (ret1 != NC_NOERR || ret2 != NC_NOERR) {
             printf("Error leyendo NetCDF en (%d,%d): %s\n", j, k, nc_strerror(ret1 != NC_NOERR ? ret1 : ret2));
             exit(EXIT_FAILURE);
           }
-          invalidValue = calculateDroughtCode(data_empty, time);
-          if(!previous_invalidValue)
+          int invalidValue = calculateDroughtCode(&data, time);
+          if(!invalidValue)
           {
-            // cambiar para que se ejecute con GPU
-            memcpy((*data_full).orderedTg, (*data_full).part_tg_val, sizeof(short) * TIME);
-            thrust::sort(thrust::host, (*data_full).orderedTg, (*data_full).orderedTg + TIME);
-            calculateEstresTermico(data_full);
-  
-            cudaMemcpyAsync((*data_full).orderedPrec, d_output, TIME*sizeof(float), cudaMemcpyDeviceToHost, stream);
-	          cudaStreamSynchronize(stream);
-            calculateEstresHidrico(data_full);
+            cudaMemcpyAsync(d_input, data.part_tg_val, TIME*sizeof(short), cudaMemcpyHostToDevice, stream);
+            cub::DeviceRadixSort::SortKeys(d_temp_storage, temp_storage_bytes, d_input, d_output, TIME, 0, sizeof(short)*8, stream);
+
+            // memcpy(data.orderedTg, data.part_tg_val, sizeof(short) * TIME);
+            // thrust::sort(thrust::host, data.orderedTg, data.orderedTg + TIME);
+            // calculateEstresTermico(&data);
+    
+            memcpy(data.orderedPrec, data.drought_code, sizeof(float) * TIME);
+            thrust::sort(thrust::host, data.orderedPrec, data.orderedPrec + TIME);
+            calculateEstresHidrico(&data);
+
+            cudaMemcpyAsync(data.orderedTg, d_output, TIME*sizeof(short), cudaMemcpyDeviceToHost, stream);
+            cudaStreamSynchronize(stream);
+            calculateEstresTermico(&data);
             
-            calculateAnomaliaClimatica_Batch((*data_full).estres_termico, (*data_full).estres_hidrico, (*data_full).anomalia_climatica, &local_not_valid);
-            to_write = 1;
+            calculateAnomaliaClimatica(&data, &local_not_valid);
           }
-          else if(previous)
+          else
           {
             notCalculated++;
             for(i=0; i<TIME; i++){
-              (*data_full).anomalia_climatica[i]=-1;
+              data.anomalia_climatica[i]=-1;
               local_not_valid++;
             }
-            to_write = 1;
           }
-
-          // actualización de las variables
-          data_aux = data_full;
-          data_full = data_empty;
-          data_empty = data_aux;
-          previous_invalidValue = invalidValue;
-          previous = 1;
-          start[0] = start_previous[0];
-          start[1] = start_previous[1];
-          start_previous[0] = (size_t)j;
-          start_previous[1] = (size_t)k;
-
+          #pragma omp critical
+          {
+            int retval = nc_put_vara_short(outFile.ncId, outFile.varId, start, count, data.anomalia_climatica);
+            if (retval != NC_NOERR) {
+              printf("Error al escribir en NetCDF en la celda (%d,%d): %s\n", j, k, nc_strerror(retval));
+              exit(EXIT_FAILURE);
+            }
+          } 
         } // END LOOP LON
       } // END LOOP LAT
-      if(to_write) { // SE ESCRIBE LO CALCUADO
-        #pragma omp critical
-        {
-          int retval = nc_put_vara_short(outFile.ncId, outFile.varId, start, count, (*data_empty).anomalia_climatica);
-          if (retval != NC_NOERR) {
-            printf("Error al escribir en NetCDF en la celda (%d,%d): %s\n", start[0], start[1], nc_strerror(retval));
-            exit(EXIT_FAILURE);
-          }
-        }
-      }
-      if(previous) { // en caso de que quede algún vector por terminar su iteración
-        if(!invalidValue)
-        {
-          cudaMemcpyAsync(d_input, (*data_full).drought_code, TIME*sizeof(float), cudaMemcpyHostToDevice, stream);
-          cub::DeviceRadixSort::SortKeys(d_temp_storage, temp_storage_bytes, d_input, d_output, TIME, 0, sizeof(float)*8, stream);
-          memcpy((*data_full).orderedTg, (*data_full).part_tg_val, sizeof(short) * TIME);
-          thrust::sort(thrust::host, (*data_full).orderedTg, (*data_full).orderedTg + TIME);
-          calculateEstresTermico(data_full);
-          cudaMemcpyAsync((*data_full).orderedPrec, d_output, TIME*sizeof(float), cudaMemcpyDeviceToHost, stream);
-	        cudaStreamSynchronize(stream);
-          calculateEstresHidrico(data_full);
-          calculateAnomaliaClimatica_Batch((*data_full).estres_termico, (*data_full).estres_hidrico, (*data_full).anomalia_climatica, &local_not_valid);
-        }
-        else
-        {
-          notCalculated++;
-          for(i=0; i<TIME; i++){
-            (*data_full).anomalia_climatica[i]=-1;
-            local_not_valid++;
-          }
-        }
-        #pragma omp critical
-        {
-          int retval = nc_put_vara_short(outFile.ncId, outFile.varId, start_previous, count, (*data_full).anomalia_climatica);
-          if (retval != NC_NOERR) {
-            printf("Error al escribir en NetCDF en la celda (%d,%d): %s\n", start_previous[0], start_previous[1], nc_strerror(retval));
-            exit(EXIT_FAILURE);
-          }
-        }
-      }
       total_not_valid += local_not_valid;
-      cudaFree(d_temp_storage);
-      cudaFree(d_input);
-      cudaFree(d_output);
-      cudaStreamDestroy(stream);
-
       printf("Producer thread: %d finished, Invalid cells: %lu , Invalid values: %lu\n", threadId, notCalculated, local_not_valid);
     } // FIN PRAGMA
     
@@ -369,19 +291,6 @@ void calculateAnomaliaClimatica(PointData *data, unsigned long *not_valid) {
     }
     else {
       data->anomalia_climatica[i] = (data->estres_termico[i] + data->estres_hidrico[i]) / 2;
-    }
-  }
-}
-
-void calculateAnomaliaClimatica_Batch(short* estres_termico, short* estres_hidrico, short* anomalia_climatica, unsigned long *not_valid) {
-  for (int i = 0; i < TIME; i++) {
-    if (estres_termico[i] < 1 || estres_termico[i] > 99 ||
-        estres_hidrico[i] < 1 || estres_hidrico[i] > 99) {
-        anomalia_climatica[i] = -1;
-      (*not_valid)++;
-    }
-    else {
-      anomalia_climatica[i] = (estres_termico[i] + estres_hidrico[i]) / 2;
     }
   }
 }

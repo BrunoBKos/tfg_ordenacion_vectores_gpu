@@ -1,8 +1,7 @@
 /*
-  Calculo de anomalia climatica paralelo (2026)
+  Calculo de anomalia climatica paralelo (2025)
   Autor: Bastian Troncoso Retamales
-  Modificaciones: Bruno Burgos Kosmalski
-  Sort -> Thrust en CPU y DeviceSegmentedRadixSort (CUB) en GPU
+  Sort -> Thrust en CPU
 */
 
 #include <stdio.h>
@@ -24,7 +23,8 @@
 */
 #include "case_study.h" // 
 
-int NUM_THREADS = 1;  
+int NUM_THREADS = 1;
+int ITERS = 1;  
 #define FLOAT_TOLERANCE 1e-5f
 #define NC_ERR(e) {printf("Error: %s\n", nc_strerror(e)); exit(EXIT_FAILURE);}
 
@@ -54,21 +54,6 @@ typedef struct {
   short orderedTg[TIME];
   float orderedPrec[TIME];
 } PointData;
-
-typedef struct {
-  short part_tg_val_full[TIME*LON];
-  float part_prec_val_full[TIME*LON];
-  float drought_code_full[TIME*LON];
-  short part_tg_val_empty[TIME*LON];
-  float part_prec_val_empty[TIME*LON];
-  float drought_code_empty[TIME*LON];
-  short estres_termico[TIME*LON];
-  short estres_hidrico[TIME*LON];
-  short anomalia_climatica_full[TIME*LON];
-  short anomalia_climatica_empty[TIME*LON];
-  short orderedTg[TIME*LON];
-  float orderedPrec[TIME*LON];
-} PointData_Batch;
 
 typedef struct {
   int ncId;
@@ -104,12 +89,13 @@ __global__ void emptyKernel() {}
 // -----------------------------
 int main(int argc, char *argv[]) {
 
-    if (argc != 2) {
+    if (argc < 2) {
       printf("Uso: %s <num_threads>\n", argv[0]);
       printf("Max threads: %d\n", omp_get_max_threads());
       return EXIT_FAILURE;
     }
     NUM_THREADS = atoi(argv[1]);
+    if(argc > 2) ITERS = atoi(argv[2]);
     NetCDFFile precFiles[NUM_THREADS], tgFiles[NUM_THREADS], outFile;
     double time[TIME];
     initNetCDFFiles(precFiles, tgFiles, &outFile, time, NUM_THREADS);
@@ -122,72 +108,43 @@ int main(int argc, char *argv[]) {
     /* changes to act in batch*/
 
     emptyKernel<<<1, 1>>>(); // GPU warmup
-
-    PointData_Batch* data = (PointData_Batch*) malloc(sizeof(PointData_Batch));
-    short* part_tg_val_full = (*data).part_tg_val_full;
-    float* part_prec_val_full = (*data).part_prec_val_full;
-    float* drought_code_full = (*data).drought_code_full;
-    short* part_tg_val_empty = (*data).part_tg_val_empty;
-    float* part_prec_val_empty = (*data).part_prec_val_empty;
-    float* drought_code_empty = (*data).drought_code_empty;
-    short* part_tg_val_aux;
-    float* part_prec_val_aux;
-    float* drought_code_aux;
-    short* estres_termico = (*data).estres_termico;
-    short* estres_hidrico = (*data).estres_hidrico;
-    short* anomalia_climatica_aux;
-    short* anomalia_climatica_full = (*data).anomalia_climatica_full;
-    short* anomalia_climatica_empty = (*data).anomalia_climatica_empty;
-    short* orderedTg = (*data).orderedTg;
-    float* orderedPrec = (*data).orderedPrec;
-    int retValues[LON];
+ 
+    short* part_tg_val = (short*) malloc(ITERS*TIME*LON*sizeof(short));
+    float* part_prec_val = (float*) malloc(ITERS*TIME*LON*sizeof(float));
+    float* drought_code = (float*) malloc(ITERS*TIME*LON*sizeof(float));
+    short* estres_termico = (short*) malloc(ITERS*TIME*LON*sizeof(short));
+    short* estres_hidrico = (short*) malloc(ITERS*TIME*LON*sizeof(short));
+    short* anomalia_climatica_aux;// = (short*) malloc(ITERS*TIME*LO*sizeof(short));
+    short* anomalia_climatica_full = (short*) malloc(ITERS*TIME*LON*sizeof(short));
+    short* anomalia_climatica_empty = (short*) malloc(ITERS*TIME*LON*sizeof(short));
+    short* orderedTg = (short*) malloc(ITERS*TIME*LON*sizeof(short));
+    float* orderedPrec = (float*) malloc(ITERS*TIME*LON*sizeof(float));
+    int retValues[LON*ITERS];
 
     float* d_input;
     float* d_output;
-    int h_offsets[LON+1];
+    int h_offsets[LON*ITERS+1];
     int* d_offsets;
 
     void* d_temp_storage = NULL;
     size_t temp_storage_bytes = 0;
-    cudaStream_t stream;
 
-    cudaStreamCreate(&stream);
-    cudaMalloc(&d_input, LON*TIME*sizeof(float));
-    cudaMalloc(&d_output, LON*TIME*sizeof(float));
-    cudaMalloc(&d_offsets, (LON+1)*sizeof(int));
+    cudaMalloc(&d_input, ITERS*LON*TIME*sizeof(float));
+    cudaMalloc(&d_output, ITERS*LON*TIME*sizeof(float));
+    cudaMalloc(&d_offsets, ((LON*ITERS)+1)*sizeof(int));
 
-    #pragma omp parallel num_threads(NUM_THREADS)
-    {
-      #pragma omp single nowait
-      {
-        for(int i = 0; i < (LON+1); i++) h_offsets[i] = TIME*i;
+    for(int i = 0; i < ((LON*ITERS)+1); i++) h_offsets[i] = TIME*i;
 
-        cub::DeviceSegmentedRadixSort::SortKeys(d_temp_storage, temp_storage_bytes, d_input, d_output, 
-                                                TIME*LON, LON, d_offsets, d_offsets+1, 0, sizeof(float)*8);
+    cub::DeviceSegmentedRadixSort::SortKeys(d_temp_storage, temp_storage_bytes, d_input, d_output, 
+                                            TIME*LON*ITERS, LON*ITERS, d_offsets, d_offsets+1, 0, sizeof(float)*8);
 
-        cudaMalloc(&d_temp_storage, temp_storage_bytes);
-        cudaMemcpy(d_offsets, h_offsets, (LON+1)*sizeof(int), cudaMemcpyHostToDevice);
-      }
-      int threadId = omp_get_thread_num();
-      #pragma omp for
-      for (int k = 0; k < LON; k++) { // lectura de los datos + calculo del drought_code
-        size_t read_start[3] = {0, (size_t) k, 0};
-        size_t read_count[3] = {1, 1, TIME};
-        int ret1 = nc_get_vara_short(tgFiles[threadId].ncId, tgFiles[threadId].varId, read_start, read_count, part_tg_val_full+(k*TIME));
-        int ret2 = nc_get_vara_float(precFiles[threadId].ncId, precFiles[threadId].varId, read_start, read_count, part_prec_val_full+(k*TIME));
-        if (ret1 != NC_NOERR || ret2 != NC_NOERR) {
-            printf("Error leyendo NetCDF en (%d, %d): %s\n", 0, k, nc_strerror(ret1 != NC_NOERR ? ret1 : ret2));
-            exit(EXIT_FAILURE);
-        }
-        int ret = calculateDroughtCode_Batch(part_tg_val_full+(k*TIME), part_prec_val_full+(k*TIME), drought_code_full+(k*TIME), time);
-        retValues[k] = ret;
-        if(ret) notCalculated++; 
-      }
-    }
+    cudaMalloc(&d_temp_storage, temp_storage_bytes);
+    cudaMemcpy(d_offsets, h_offsets, ((LON*ITERS)+1)*sizeof(int), cudaMemcpyHostToDevice);
 
-    for(int j = 0; j < LAT; j++) {
-      size_t start[3] = {(size_t)(j-1), 0, 0};
-      size_t count[3] = {1, LON, TIME};
+    for(int j = 0; j < LAT; j += ITERS) {
+      if((LAT%ITERS) && ((j + ITERS) < LAT)) ITERS = (LAT%ITERS);
+      size_t start[3] = {(size_t)(j-ITERS), 0, 0};
+      size_t count[3] = {(size_t) ITERS, LON, TIME};
 
       #pragma omp parallel reduction(+:total_not_valid, notCalculated) num_threads(NUM_THREADS)
       {
@@ -195,49 +152,46 @@ int main(int argc, char *argv[]) {
 
         #pragma omp single nowait
         {
-          cudaMemcpyAsync(d_input, drought_code_full, LON*TIME*sizeof(float), cudaMemcpyHostToDevice, stream);
-          cub::DeviceSegmentedRadixSort::SortKeys(d_temp_storage, temp_storage_bytes, d_input, d_output, 
-                                                TIME*LON, LON, d_offsets, d_offsets+1, 0, sizeof(float)*8, stream);
-        }
-
-        #pragma omp single nowait
-        {
           if(j != 0) {
             int retval = nc_put_vara_short(outFile.ncId, outFile.varId, start, count, anomalia_climatica_full);
             if (retval != NC_NOERR) {
-              printf("Error al escribir en NetCDF en la celda (%d): %s\n", (j-1), nc_strerror(retval));
+              printf("Error al escribir en NetCDF en la celda (%d): %s\n", (j-ITERS), nc_strerror(retval));
               exit(EXIT_FAILURE);
             }
           }
         }
-        if((j+1) < LAT) {
-          #pragma omp for nowait
+
+        #pragma omp for collapse(2) nowait
+        for(int t = 0; t < ITERS; t++) { 
           for (int k = 0; k < LON; k++) { // lectura de los datos + calculo del drought_code
-            size_t read_start[3] = {(size_t)j, (size_t) k, 0};
+            int offset = (((t*LON)+k)*TIME);
+            size_t read_start[3] = {(size_t) (j+t), (size_t) k, 0};
             size_t read_count[3] = {1, 1, TIME};
-            int ret1 = nc_get_vara_short(tgFiles[threadId].ncId, tgFiles[threadId].varId, read_start, read_count, part_tg_val_empty+(k*TIME));
-            int ret2 = nc_get_vara_float(precFiles[threadId].ncId, precFiles[threadId].varId, read_start, read_count, part_prec_val_empty+(k*TIME));
+            int ret1 = nc_get_vara_short(tgFiles[threadId].ncId, tgFiles[threadId].varId, read_start, read_count, part_tg_val+offset);
+            int ret2 = nc_get_vara_float(precFiles[threadId].ncId, precFiles[threadId].varId, read_start, read_count, part_prec_val+offset);
             if (ret1 != NC_NOERR || ret2 != NC_NOERR) {
-                printf("Error leyendo NetCDF en (%d, %d): %s\n", j, k, nc_strerror(ret1 != NC_NOERR ? ret1 : ret2));
+                printf("Error leyendo NetCDF en (%d, %d): %s\n", j + t, k, nc_strerror(ret1 != NC_NOERR ? ret1 : ret2));
                 exit(EXIT_FAILURE);
             }
-            int ret = calculateDroughtCode_Batch(part_tg_val_empty+(k*TIME), part_prec_val_empty+(k*TIME), drought_code_empty+(k*TIME), time);
-            retValues[k] = ret;
+            int ret = calculateDroughtCode_Batch(part_tg_val+offset, part_prec_val+offset, drought_code+offset, time);
+            retValues[t*LON + k] = ret;
             if(ret) notCalculated++; 
           }
         }
-       
-        #pragma omp single nowait 
-        {
-          cudaMemcpyAsync(orderedPrec, d_output, LON*TIME*sizeof(float), cudaMemcpyDeviceToHost, stream);
-        }
 
+        #pragma omp single nowait
+        {
+          cudaMemcpy(d_input, drought_code, LON*TIME*ITERS*sizeof(float), cudaMemcpyHostToDevice);
+          cub::DeviceSegmentedRadixSort::SortKeys(d_temp_storage, temp_storage_bytes, d_input, d_output, 
+                                                TIME*LON*ITERS, LON*ITERS, d_offsets, d_offsets+1, 0, sizeof(float)*8);
+        }
+       
         #pragma omp for nowait
-        for (int k = 0; k < LON; k++) {
+        for (int k = 0; k < (LON*ITERS); k++) {
           if(!(retValues[k])) {
-            memcpy(orderedTg+(k*TIME), part_tg_val_full+(k*TIME), sizeof(short) * TIME);
+            memcpy(orderedTg+(k*TIME), part_tg_val+(k*TIME), sizeof(short) * TIME);
             thrust::sort(thrust::host, orderedTg+(k*TIME), orderedTg+((k+1)*TIME));
-            calculateEstresTermico_Batch(part_tg_val_full+(k*TIME), orderedTg+(k*TIME), estres_termico+(k*TIME));
+            calculateEstresTermico_Batch(part_tg_val+(k*TIME), orderedTg+(k*TIME), estres_termico+(k*TIME));
           }
           else {
             for(int i=0; i<TIME; i++){
@@ -248,47 +202,36 @@ int main(int argc, char *argv[]) {
 
         #pragma omp single
         {
-          cudaStreamSynchronize(stream);
+          cudaMemcpy(orderedPrec, d_output, LON*TIME*ITERS*sizeof(float), cudaMemcpyDeviceToHost);
         }
         #pragma omp barrier
 
         unsigned long local_not_valid = 0;
 
         #pragma omp for
-        for (int k = 0; k < LON; k++) { // estres hidrico + anomalia climatica
+        for (int k = 0; k < (LON*ITERS); k++) { // estres hidrico + anomalia climatica
           if(!(retValues[k])) {
-            calculateEstresHidrico_Batch(orderedPrec+(k*TIME), drought_code_full+(k*TIME), estres_hidrico+(k*TIME));
+            calculateEstresHidrico_Batch(orderedPrec+(k*TIME), drought_code+(k*TIME), estres_hidrico+(k*TIME));
             calculateAnomaliaClimatica_Batch(estres_termico+(k*TIME), estres_hidrico+(k*TIME), anomalia_climatica_empty+(k*TIME), &local_not_valid);
           }
         }
-        total_not_valid += local_not_valid;
 
         anomalia_climatica_aux = anomalia_climatica_empty;
         anomalia_climatica_empty = anomalia_climatica_full;
         anomalia_climatica_full = anomalia_climatica_aux;
 
-        part_tg_val_aux = part_tg_val_full;
-        part_tg_val_full = part_tg_val_empty;
-        part_tg_val_empty = part_tg_val_aux;
-
-        part_prec_val_aux = part_prec_val_full;
-        part_prec_val_full = part_prec_val_empty;
-        part_prec_val_empty = part_prec_val_aux;
-        
-        drought_code_aux = drought_code_full;
-        drought_code_full = drought_code_empty;
-        drought_code_empty = drought_code_aux;
+        total_not_valid += local_not_valid;
       }
     } // END LOOP LAT
 
-    size_t start[3] = {(size_t) (LAT-1), 0, 0};
-    size_t count[3] = {1, LON, TIME};
+    size_t start[3] = {(size_t) (LAT-ITERS), 0, 0};
+    size_t count[3] = {(size_t) ITERS, LON, TIME};
+
     int retval = nc_put_vara_short(outFile.ncId, outFile.varId, start, count, anomalia_climatica_full);
     if (retval != NC_NOERR) {
-      printf("Error al escribir en NetCDF en la celda (%d): %s\n", LAT-1, nc_strerror(retval));
+      printf("Error al escribir en NetCDF en la celda (%d): %s\n", LAT-ITERS, nc_strerror(retval));
       exit(EXIT_FAILURE);
     }
-    free(data);
     cudaFree(d_input);
     cudaFree(d_output);
     cudaFree(d_offsets);

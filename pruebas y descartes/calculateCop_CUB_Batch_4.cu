@@ -1,8 +1,7 @@
 /*
-  Calculo de anomalia climatica paralelo (2026)
+  Calculo de anomalia climatica paralelo (2025)
   Autor: Bastian Troncoso Retamales
-  Modificaciones: Bruno Burgos Kosmalski
-  Sort -> Thrust en CPU y DeviceSegmentedRadixSort (CUB) en GPU
+  Sort -> Thrust en CPU
 */
 
 #include <stdio.h>
@@ -57,10 +56,10 @@ typedef struct {
 
 typedef struct {
   short part_tg_val_full[TIME*LON];
-  float part_prec_val_full[TIME*LON];
-  float drought_code_full[TIME*LON];
   short part_tg_val_empty[TIME*LON];
+  float part_prec_val_full[TIME*LON];
   float part_prec_val_empty[TIME*LON];
+  float drought_code_full[TIME*LON];
   float drought_code_empty[TIME*LON];
   short estres_termico[TIME*LON];
   short estres_hidrico[TIME*LON];
@@ -124,18 +123,18 @@ int main(int argc, char *argv[]) {
     emptyKernel<<<1, 1>>>(); // GPU warmup
 
     PointData_Batch* data = (PointData_Batch*) malloc(sizeof(PointData_Batch));
+    short* part_tg_val;
     short* part_tg_val_full = (*data).part_tg_val_full;
-    float* part_prec_val_full = (*data).part_prec_val_full;
-    float* drought_code_full = (*data).drought_code_full;
     short* part_tg_val_empty = (*data).part_tg_val_empty;
+    float* part_prec_val;
+    float* part_prec_val_full = (*data).part_prec_val_full;
     float* part_prec_val_empty = (*data).part_prec_val_empty;
+    float* drought_code;
+    float* drought_code_full = (*data).drought_code_full;
     float* drought_code_empty = (*data).drought_code_empty;
-    short* part_tg_val_aux;
-    float* part_prec_val_aux;
-    float* drought_code_aux;
     short* estres_termico = (*data).estres_termico;
     short* estres_hidrico = (*data).estres_hidrico;
-    short* anomalia_climatica_aux;
+    short* anomalia_climatica_aux;// = (*data).;
     short* anomalia_climatica_full = (*data).anomalia_climatica_full;
     short* anomalia_climatica_empty = (*data).anomalia_climatica_empty;
     short* orderedTg = (*data).orderedTg;
@@ -150,24 +149,23 @@ int main(int argc, char *argv[]) {
     void* d_temp_storage = NULL;
     size_t temp_storage_bytes = 0;
     cudaStream_t stream;
-
+    
     cudaStreamCreate(&stream);
+
     cudaMalloc(&d_input, LON*TIME*sizeof(float));
     cudaMalloc(&d_output, LON*TIME*sizeof(float));
     cudaMalloc(&d_offsets, (LON+1)*sizeof(int));
 
+    for(int i = 0; i < (LON+1); i++) h_offsets[i] = TIME*i;
+
+    cub::DeviceSegmentedRadixSort::SortKeys(d_temp_storage, temp_storage_bytes, d_input, d_output, 
+                                            TIME*LON, LON, d_offsets, d_offsets+1, 0, sizeof(float)*8);
+
+    cudaMalloc(&d_temp_storage, temp_storage_bytes);
+    cudaMemcpy(d_offsets, h_offsets, (LON+1)*sizeof(int), cudaMemcpyHostToDevice);
+
     #pragma omp parallel num_threads(NUM_THREADS)
     {
-      #pragma omp single nowait
-      {
-        for(int i = 0; i < (LON+1); i++) h_offsets[i] = TIME*i;
-
-        cub::DeviceSegmentedRadixSort::SortKeys(d_temp_storage, temp_storage_bytes, d_input, d_output, 
-                                                TIME*LON, LON, d_offsets, d_offsets+1, 0, sizeof(float)*8);
-
-        cudaMalloc(&d_temp_storage, temp_storage_bytes);
-        cudaMemcpy(d_offsets, h_offsets, (LON+1)*sizeof(int), cudaMemcpyHostToDevice);
-      }
       int threadId = omp_get_thread_num();
       #pragma omp for
       for (int k = 0; k < LON; k++) { // lectura de los datos + calculo del drought_code
@@ -184,21 +182,15 @@ int main(int argc, char *argv[]) {
         if(ret) notCalculated++; 
       }
     }
-
+    
     for(int j = 0; j < LAT; j++) {
       size_t start[3] = {(size_t)(j-1), 0, 0};
       size_t count[3] = {1, LON, TIME};
 
+
       #pragma omp parallel reduction(+:total_not_valid, notCalculated) num_threads(NUM_THREADS)
       {
         int threadId = omp_get_thread_num();
-
-        #pragma omp single nowait
-        {
-          cudaMemcpyAsync(d_input, drought_code_full, LON*TIME*sizeof(float), cudaMemcpyHostToDevice, stream);
-          cub::DeviceSegmentedRadixSort::SortKeys(d_temp_storage, temp_storage_bytes, d_input, d_output, 
-                                                TIME*LON, LON, d_offsets, d_offsets+1, 0, sizeof(float)*8, stream);
-        }
 
         #pragma omp single nowait
         {
@@ -210,10 +202,11 @@ int main(int argc, char *argv[]) {
             }
           }
         }
+
         if((j+1) < LAT) {
           #pragma omp for nowait
           for (int k = 0; k < LON; k++) { // lectura de los datos + calculo del drought_code
-            size_t read_start[3] = {(size_t)j, (size_t) k, 0};
+            size_t read_start[3] = {(size_t) (j+1), (size_t) k, 0};
             size_t read_count[3] = {1, 1, TIME};
             int ret1 = nc_get_vara_short(tgFiles[threadId].ncId, tgFiles[threadId].varId, read_start, read_count, part_tg_val_empty+(k*TIME));
             int ret2 = nc_get_vara_float(precFiles[threadId].ncId, precFiles[threadId].varId, read_start, read_count, part_prec_val_empty+(k*TIME));
@@ -226,12 +219,6 @@ int main(int argc, char *argv[]) {
             if(ret) notCalculated++; 
           }
         }
-       
-        #pragma omp single nowait 
-        {
-          cudaMemcpyAsync(orderedPrec, d_output, LON*TIME*sizeof(float), cudaMemcpyDeviceToHost, stream);
-        }
-
         #pragma omp for nowait
         for (int k = 0; k < LON; k++) {
           if(!(retValues[k])) {
@@ -246,38 +233,49 @@ int main(int argc, char *argv[]) {
           }
         }
 
-        #pragma omp single
-        {
-          cudaStreamSynchronize(stream);
-        }
-        #pragma omp barrier
+
+        // #pragma omp single nowait
+        // {
+        //   cudaMemcpyAsync(d_input, drought_code_full, LON*TIME*sizeof(float), cudaMemcpyHostToDevice, stream);
+        //   cub::DeviceSegmentedRadixSort::SortKeys(d_temp_storage, temp_storage_bytes, d_input, d_output, 
+        //                                         TIME*LON, LON, d_offsets, d_offsets+1, 0, sizeof(float)*8, stream);
+        //   cudaMemcpyAsync(orderedPrec, d_output, LON*TIME*sizeof(float), cudaMemcpyDeviceToHost, stream);
+        // }
+        // #pragma omp single
+        // {
+        //   cudaStreamSynchronize(stream);
+        // }
+        // #pragma omp barrier
 
         unsigned long local_not_valid = 0;
 
         #pragma omp for
         for (int k = 0; k < LON; k++) { // estres hidrico + anomalia climatica
           if(!(retValues[k])) {
+            memcpy(orderedPrec+(k*TIME), drought_code_full+(k*TIME), sizeof(float) * TIME);
+            thrust::sort(thrust::host, orderedPrec+(k*TIME), orderedPrec+((k+1)*TIME));
             calculateEstresHidrico_Batch(orderedPrec+(k*TIME), drought_code_full+(k*TIME), estres_hidrico+(k*TIME));
             calculateAnomaliaClimatica_Batch(estres_termico+(k*TIME), estres_hidrico+(k*TIME), anomalia_climatica_empty+(k*TIME), &local_not_valid);
           }
         }
-        total_not_valid += local_not_valid;
 
         anomalia_climatica_aux = anomalia_climatica_empty;
         anomalia_climatica_empty = anomalia_climatica_full;
         anomalia_climatica_full = anomalia_climatica_aux;
 
-        part_tg_val_aux = part_tg_val_full;
+        part_tg_val = part_tg_val_full;
         part_tg_val_full = part_tg_val_empty;
-        part_tg_val_empty = part_tg_val_aux;
+        part_tg_val_empty = part_tg_val;
 
-        part_prec_val_aux = part_prec_val_full;
+        part_prec_val = part_prec_val_full;
         part_prec_val_full = part_prec_val_empty;
-        part_prec_val_empty = part_prec_val_aux;
+        part_prec_val_empty = part_prec_val;
         
-        drought_code_aux = drought_code_full;
+        drought_code = drought_code_full;
         drought_code_full = drought_code_empty;
-        drought_code_empty = drought_code_aux;
+        drought_code_empty = drought_code;
+
+        total_not_valid += local_not_valid;
       }
     } // END LOOP LAT
 
@@ -288,7 +286,6 @@ int main(int argc, char *argv[]) {
       printf("Error al escribir en NetCDF en la celda (%d): %s\n", LAT-1, nc_strerror(retval));
       exit(EXIT_FAILURE);
     }
-    free(data);
     cudaFree(d_input);
     cudaFree(d_output);
     cudaFree(d_offsets);

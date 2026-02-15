@@ -1,0 +1,24 @@
+Repositorio del TFG "Aceleración mediante GPU de un Modelo de Identificación de Anomalías Meteorológicas 
+con Alta Incidencia en la Predicción de Incendios Forestales" de Bruno Burgos Kosmalski
+
+Este proyecto tiene como objetivo retomar una de las líneas de optimización del trabajo previo de Esteban 
+Aspe Ruiz en el TFG "Implementación y Evaluación de un Algoritmo de Altas Prestaciones para el Cálculo de 
+la Anomalía Climática" cuyo código original se encuentra en el siguiente enlace: 
+"[enlace](https://github.com/Esteve2604/tfg_anomalia_climatica)". 
+Cuyo código ha sido optimizado y depurado por el trabajo de Bastian Troncoso Retamales, en el que se han 
+evaluado las implementaciones.
+
+El repositorio está estructurado en cuatro directorios distitos: tres directorios con implemetaciones finales,
+y un directorio con códigos intermedios y descartes producidos durante la producción de este proyecto. 
+
+Las pruebas finales se descomponen entonces en tres partes:
+    vector_unico -> evaluación de algoritmos para la ordenación de un único vector en GPU
+    multiples_vectores -> evaluación de algoritmos para la ordenación de múltiples vectores en GPU
+    implementaciones_finales -> evaluación de implementaciones en el código para el cálculo de la Anomalía 
+        Clinática delegando la ordenación de vectores en la GPU
+
+Todos los programas de este proyecto se han desarrollado para trabajar con GPUs de la marca NVDIA usando CUDA, 
+por lo que para compilar los programas es necesario usar el compilador de NVIDIA (nvcc) contando con las 
+librerias necesarias para su correcta compilación y ejecución. 
+En todas las carpetas con las implementaciones finales se encuentra un fichero Makefile de ejemplo que se 
+puede usar para compilar dichos programas o, como referencia.
